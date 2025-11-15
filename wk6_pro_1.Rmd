@@ -7,6 +7,7 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message= FALSE, warning=FALSE)
+par(pty="s", mar=c(5,5,3,1), oma=c(0,0,1,0))
 ```
 
 ## Detecting spatial patterns--The distribution of blue plaques in the London boroughs
@@ -49,6 +50,7 @@ Note that the `echo = FALSE` parameter was added to the code chunk to prevent pr
 ```{r Obtain blue plaque data}
 ##Now get the location of all Blue Plaques in the City
 BluePlaques <- st_read("https://s3.eu-west-2.amazonaws.com/openplaques/open-plaques-london-2018-04-08.geojson")
+BluePlaques <- st_transform(BluePlaques, 27700)
 
 summary(BluePlaques)
 ```
@@ -73,8 +75,6 @@ BluePlaques <- distinct(BluePlaques)
 ```
 
 ```{r satial subsetting}
-BoroughMap <- st_transform(BoroughMap, st_crs(BluePlaques))
-
 BluePlaquesSub <- BluePlaques[BoroughMap,]
 
 #plot the blue plaques in the city
@@ -113,12 +113,155 @@ tm_shape(BluePlaquesSub) +
   tm_dots(fill = "blue", size=0.1)
 ```
 
-```{r}
+```{r window and conversion PPP,fig.width=8,fig.height=6}
+#now set a window as the borough boundary
+window <- as.owin(Harrow)
+plot(window)
+
+#create a sp object
+BluePlaquesSub<- BluePlaquesSub %>%
+  as(., 'Spatial')
+#create a ppp object
+BluePlaquesSub.ppp <- ppp(x=BluePlaquesSub@coords[,1],
+                          y=BluePlaquesSub@coords[,2],
+                          window=window)
+
+BluePlaquesSub@coords[,1]
+
+BluePlaquesSub.ppp %>%
+  plot(.,pch=16,cex=0.5, 
+       main="Blue Plaques Harrow")
+```
+
+
+```{r kernel density estimation}
+BluePlaquesSub.ppp %>%
+  density(., sigma=200) %>%
+  plot()
+
+BluePlaquesSub.ppp %>%
+  density(., sigma=500) %>%
+  plot()
+
+BluePlaquesSub.ppp %>%
+  density(., sigma=1000) %>%
+  plot()
+
+```
+```{r quadrat analysis}
+#First plot the points
+plot(BluePlaquesSub.ppp,
+     pch=16,
+     cex=0.5, 
+     main="Blue Plaques in Harrow")
+
+#now count the points in that fall in a 6 x 6
+#grid overlaid across the windowBluePlaquesSub.ppp2<-BluePlaquesSub.ppp %>%
+BluePlaquesSub.ppp %>%
+  quadratcount(.,nx = 6, ny = 6)%>%
+    plot(., add=T, col="red")
+```
+```{r data to table conversion}
+#run the quadrat count
+Qcount <- BluePlaquesSub.ppp %>%
+  quadratcount(.,nx = 6, ny = 6) %>%
+  as.data.frame() %>%
+  dplyr::count(Var1=Freq)%>%
+  dplyr::rename(Freqquadratcount=n)
+
+#Check the data type in the first column — if it is factor, we will need to convert it to numeric
+Qcount %>% 
+  summarise_all(class)
+```
+
+```{r calculate expected value}
+sums <- Qcount %>%
+  #calculate the total blue plaques (Var * Freq)
+  mutate(total = Var1 * Freqquadratcount) %>%
+  dplyr::summarise(across(everything(), sum))%>%
+  dplyr::select(-Var1) 
+
+lambda<- Qcount%>%
+  #calculate lambda
+  mutate(total = Var1 * Freqquadratcount)%>%
+  dplyr::summarise(across(everything(), sum)) %>%
+  mutate(lambda=total/Freqquadratcount) %>%
+  dplyr::select(lambda)%>%
+  pull(lambda)
+```
+
+```{r poisson probability}
+QCountTable <- Qcount %>%
+  mutate(Pr=((lambda^Var1)*exp(-lambda))/factorial(Var1))%>%
+  #now calculate the expected counts based on our total number of plaques
+  #and save them to the table
+  mutate(Expected= (round(Pr * sums$Freqquadratcount, 0)))
+
+#Compare the frequency distributions of the observed and expected point patterns
+plot(c(1,5),c(0,14), type="n",
+xlab="Number of Blue Plaques (Red=Observed,Blue=Expected)", 
+     ylab="Frequency of Occurances")
+points(QCountTable$Freqquadratcount, 
+       col="Red", 
+       type="o", 
+       lwd=3)
+points(QCountTable$Expected, col="Blue", 
+       type="o", 
+       lwd=3)
+```
+
+```{r chi-square test}
+teststats <- quadrat.test(BluePlaquesSub.ppp, nx = 6, ny = 6)
+
+plot(BluePlaquesSub.ppp,pch=16,cex=0.5, main="Blue Plaques in Harrow")
+plot(teststats, add=T, col = "red")
+```
+
+```{r ripley's K}
+K <- BluePlaquesSub.ppp %>%
+  Kest(., correction="border") %>%
+  plot()
+
+# we can also extract the plot into a dataframe
+Kval <- as.data.frame(Kest(BluePlaquesSub.ppp, correction = "Ripley"))
 
 ```
 
-```{r}
+```{r DBSCAN}
+library(fpc)
+
+#first check the coordinate reference system of the Harrow spatial polygon:
+st_geometry(BoroughMap)
+
+#first extract the points from the spatial points data frame
+BluePlaquesSubPoints <- BluePlaquesSub %>%
+  coordinates(.)%>%
+  as.data.frame()
+
+#now run the dbscan analysis
+db <- BluePlaquesSubPoints %>%
+  fpc::dbscan(.,eps = 700, MinPts = 4)
+
+#now plot the results
+plot(db, BluePlaquesSubPoints, main = "DBSCAN Output", frame = F)
+plot(BoroughMap$geometry, add=T)
+
+# used to find suitable eps value based on the knee in plot
+# k is no of nearest neighbours used, use min points
+library(dbscan)
+
+BluePlaquesSubPoints%>%
+  dbscan::kNNdistplot(.,k=4)
+
+library(ggplot2)
+
+db
+
+db$cluster
+
+BluePlaquesSubPoints<- BluePlaquesSubPoints %>%
+  mutate(dbcluster=db$cluster)
+
 
 ```
-
 
